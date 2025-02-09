@@ -4,7 +4,7 @@ import { Application, Router } from "https://deno.land/x/oak@v12.6.1/mod.ts";
 const CONFIG = {
   PORT: parseInt(Deno.env.get("PORT") || "8000"),
   HF_TOKEN: Deno.env.get("HF_TOKEN") || "",
-  DEFAULT_MODEL: "google/gemma-2-2b-it",
+  DEFAULT_MODEL: "meta-llama/Llama-2-7b-chat-hf",
 };
 
 // SSE 工具类
@@ -37,16 +37,25 @@ class SSEWriter {
 
 // 响应转换工具
 function transformResponse(hfResponse: any) {
+  let content = "";
+  if (Array.isArray(hfResponse)) {
+    content = hfResponse[0]?.generated_text || "";
+  } else if (typeof hfResponse === 'object') {
+    content = hfResponse.generated_text || "";
+  } else {
+    content = String(hfResponse || "");
+  }
+
   return {
     id: crypto.randomUUID(),
     object: "chat.completion",
     created: Date.now(),
-    model: hfResponse.model || "unknown",
+    model: CONFIG.DEFAULT_MODEL,
     choices: [{
       index: 0,
       message: {
         role: "assistant",
-        content: Array.isArray(hfResponse) ? hfResponse[0]?.generated_text : hfResponse.generated_text || ""
+        content: content.trim()
       },
       finish_reason: "stop"
     }],
@@ -63,7 +72,7 @@ function transformStreamResponse(chunk: any) {
     id: crypto.randomUUID(),
     object: "chat.completion.chunk",
     created: Date.now(),
-    model: "unknown",
+    model: CONFIG.DEFAULT_MODEL,
     choices: [{
       index: 0,
       delta: {
@@ -73,24 +82,6 @@ function transformStreamResponse(chunk: any) {
       finish_reason: null
     }]
   };
-}
-
-// 构造系统提示词
-function constructPrompt(messages: any[]) {
-  let prompt = "";
-  
-  for (const msg of messages) {
-    if (msg.role === "system") {
-      prompt += `System: ${msg.content}\n`;
-    } else if (msg.role === "assistant") {
-      prompt += `Assistant: ${msg.content}\n`;
-    } else if (msg.role === "user") {
-      prompt += `Human: ${msg.content}\n`;
-    }
-  }
-  
-  prompt += "Assistant:";
-  return prompt;
 }
 
 const app = new Application();
@@ -128,109 +119,69 @@ app.use(async (ctx, next) => {
 
 // Chat completion endpoint
 router.post("/v1/chat/completions", async (ctx) => {
-  const body = await ctx.request.body().value;
-  const { 
-    messages, 
-    stream = false, 
-    model = CONFIG.DEFAULT_MODEL,
-    max_tokens,
-    temperature,
-    top_p,
-    frequency_penalty
-  } = body;
+  try {
+    const body = await ctx.request.body().value;
+    const { 
+      messages, 
+      stream = false,
+      temperature = 0.7,
+      max_tokens = 500,
+      model = CONFIG.DEFAULT_MODEL
+    } = body;
 
-  // 检查必要参数
-  if (!messages || !Array.isArray(messages) || messages.length === 0) {
-    ctx.response.status = 400;
-    ctx.response.body = {
-      error: {
-        message: "Invalid messages format",
-        type: "invalid_request_error"
+    if (!messages || !Array.isArray(messages) || messages.length === 0) {
+      ctx.response.status = 400;
+      ctx.response.body = {
+        error: {
+          message: "Invalid messages format",
+          type: "invalid_request_error"
+        }
+      };
+      return;
+    }
+
+    const lastMessage = messages[messages.length - 1];
+
+    // 这里我们使用 text-generation 的直接格式
+    const payload = {
+      inputs: lastMessage.content,
+      parameters: {
+        max_new_tokens: max_tokens,
+        temperature: temperature,
+        return_full_text: false,
+        do_sample: true
       }
     };
-    return;
-  }
 
-  // 构造prompt
-  const prompt = constructPrompt(messages);
-  
-  const payload = {
-    inputs: prompt,
-    parameters: {
-      max_new_tokens: max_tokens || 500,
-      temperature: temperature || 0.7,
-      top_p: top_p || 1,
-      repetition_penalty: frequency_penalty ? 1 + frequency_penalty : 1,
-      return_full_text: false,
+    const apiUrl = `https://api-inference.huggingface.co/models/${model}`;
+
+    const response = await fetch(apiUrl, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${CONFIG.HF_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error("HF API Error Response:", errorText);
+      throw new Error(`HuggingFace API error: ${response.status} ${response.statusText}`);
     }
-  };
 
-  console.log("Sending request to HF:", {
-    model,
-    payload: JSON.stringify(payload),
-  });
+    const data = await response.json();
+    ctx.response.body = transformResponse(data);
 
-  const apiUrl = `https://api-inference.huggingface.co/models/${model}`;
-
-  if (stream) {
-    const sse = new SSEWriter(ctx);
-    
-    try {
-      const response = await fetch(apiUrl, {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${CONFIG.HF_TOKEN}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(payload),
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`HuggingFace API error: ${response.statusText}. ${errorText}`);
+  } catch (error) {
+    console.error("Request error:", error);
+    ctx.response.status = error.status || 500;
+    ctx.response.body = {
+      error: {
+        message: error.message,
+        type: "api_error"
       }
-
-      const reader = response.body!.getReader();
-      const decoder = new TextDecoder();
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        
-        const chunk = decoder.decode(value);
-        const transformedChunk = transformStreamResponse(chunk);
-        sse.send(transformedChunk);
-      }
-
-      sse.send("[DONE]");
-    } catch (error) {
-      console.error("Stream error:", error);
-      sse.send({ error: error.message });
-    } finally {
-      sse.close();
-    }
-  } else {
-    try {
-      const response = await fetch(apiUrl, {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${CONFIG.HF_TOKEN}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(payload),
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`HuggingFace API error: ${response.statusText}. ${errorText}`);
-      }
-
-      const data = await response.json();
-      ctx.response.body = transformResponse(data);
-    } catch (error) {
-      console.error("Request error:", error);
-      throw error;
-    }
+    };
   }
 });
 
@@ -239,7 +190,8 @@ router.get("/health", (ctx) => {
   ctx.response.body = { 
     status: "ok", 
     timestamp: new Date().toISOString(),
-    token: CONFIG.HF_TOKEN ? "configured" : "missing"
+    token: CONFIG.HF_TOKEN ? "configured" : "missing",
+    model: CONFIG.DEFAULT_MODEL
   };
 });
 
