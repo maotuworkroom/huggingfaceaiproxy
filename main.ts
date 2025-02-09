@@ -1,8 +1,9 @@
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 
-// 替换为你的 Hugging Face API Key
+// Hugging Face API Key
 const HF_API_KEY = "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";
 
+// 允许跨域请求的 Headers
 const headers = {
   "Content-Type": "application/json",
   "Access-Control-Allow-Origin": "*",
@@ -10,6 +11,7 @@ const headers = {
   "Access-Control-Allow-Headers": "Content-Type, Authorization",
 };
 
+// 处理请求
 async function handleRequest(req: Request): Promise<Response> {
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 204, headers });
@@ -22,11 +24,14 @@ async function handleRequest(req: Request): Promise<Response> {
   try {
     const { model, messages, max_tokens, temperature } = await req.json();
 
-    if (!model || !messages) {
-      return new Response(JSON.stringify({ error: "Missing required parameters" }), { status: 400, headers });
+    if (!model || !messages || !Array.isArray(messages) || messages.length === 0) {
+      return new Response(JSON.stringify({ error: "Invalid request format" }), { status: 400, headers });
     }
 
-    // 限制 max_tokens 避免请求过大
+    // 转换 OpenAI 格式的 messages 为 Hugging Face 支持的输入格式
+    const inputText = messages.map(msg => `${msg.role}: ${msg.content}`).join("\n");
+
+    // 限制 max_tokens 避免 Hugging Face 拒绝请求
     const safe_max_tokens = Math.min(max_tokens ?? 1024, 2048);
 
     const hfResponse = await fetch(`https://api-inference.huggingface.co/models/${model}`, {
@@ -36,7 +41,7 @@ async function handleRequest(req: Request): Promise<Response> {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        inputs: messages,
+        inputs: inputText, // 关键修改：用文本传入，而不是 messages
         parameters: {
           max_new_tokens: safe_max_tokens,
           temperature: temperature ?? 0.7,
@@ -50,6 +55,7 @@ async function handleRequest(req: Request): Promise<Response> {
     }
 
     const hfData = await hfResponse.json();
+
     return new Response(JSON.stringify(hfData), { status: 200, headers });
 
   } catch (error) {
@@ -57,5 +63,6 @@ async function handleRequest(req: Request): Promise<Response> {
   }
 }
 
+// 启动服务器
 serve(handleRequest);
 console.log("Server running on Deno Deploy...");
