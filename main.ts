@@ -46,7 +46,7 @@ function transformResponse(hfResponse: any) {
       index: 0,
       message: {
         role: "assistant",
-        content: hfResponse.generated_text || hfResponse[0]?.generated_text || ""
+        content: Array.isArray(hfResponse) ? hfResponse[0]?.generated_text : hfResponse.generated_text || ""
       },
       finish_reason: "stop"
     }],
@@ -73,6 +73,24 @@ function transformStreamResponse(chunk: any) {
       finish_reason: null
     }]
   };
+}
+
+// 构造系统提示词
+function constructPrompt(messages: any[]) {
+  let prompt = "";
+  
+  for (const msg of messages) {
+    if (msg.role === "system") {
+      prompt += `System: ${msg.content}\n`;
+    } else if (msg.role === "assistant") {
+      prompt += `Assistant: ${msg.content}\n`;
+    } else if (msg.role === "user") {
+      prompt += `Human: ${msg.content}\n`;
+    }
+  }
+  
+  prompt += "Assistant:";
+  return prompt;
 }
 
 const app = new Application();
@@ -114,20 +132,43 @@ router.post("/v1/chat/completions", async (ctx) => {
   const { 
     messages, 
     stream = false, 
-    model = CONFIG.DEFAULT_MODEL 
+    model = CONFIG.DEFAULT_MODEL,
+    max_tokens,
+    temperature,
+    top_p,
+    frequency_penalty
   } = body;
+
+  // 检查必要参数
+  if (!messages || !Array.isArray(messages) || messages.length === 0) {
+    ctx.response.status = 400;
+    ctx.response.body = {
+      error: {
+        message: "Invalid messages format",
+        type: "invalid_request_error"
+      }
+    };
+    return;
+  }
+
+  // 构造prompt
+  const prompt = constructPrompt(messages);
   
-  const lastMessage = messages[messages.length - 1];
   const payload = {
-    inputs: lastMessage.content,
-    stream: stream,
+    inputs: prompt,
     parameters: {
-      max_new_tokens: body.max_tokens || 500,
-      temperature: body.temperature || 0.7,
-      top_p: body.top_p || 1,
-      repetition_penalty: body.frequency_penalty ? 1 + body.frequency_penalty : 1,
+      max_new_tokens: max_tokens || 500,
+      temperature: temperature || 0.7,
+      top_p: top_p || 1,
+      repetition_penalty: frequency_penalty ? 1 + frequency_penalty : 1,
+      return_full_text: false,
     }
   };
+
+  console.log("Sending request to HF:", {
+    model,
+    payload: JSON.stringify(payload),
+  });
 
   const apiUrl = `https://api-inference.huggingface.co/models/${model}`;
 
@@ -145,7 +186,8 @@ router.post("/v1/chat/completions", async (ctx) => {
       });
 
       if (!response.ok) {
-        throw new Error(`HuggingFace API error: ${response.statusText}`);
+        const errorText = await response.text();
+        throw new Error(`HuggingFace API error: ${response.statusText}. ${errorText}`);
       }
 
       const reader = response.body!.getReader();
@@ -162,32 +204,43 @@ router.post("/v1/chat/completions", async (ctx) => {
 
       sse.send("[DONE]");
     } catch (error) {
+      console.error("Stream error:", error);
       sse.send({ error: error.message });
     } finally {
       sse.close();
     }
   } else {
-    const response = await fetch(apiUrl, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${CONFIG.HF_TOKEN}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(payload),
-    });
+    try {
+      const response = await fetch(apiUrl, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${CONFIG.HF_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      });
 
-    if (!response.ok) {
-      throw new Error(`HuggingFace API error: ${response.statusText}`);
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`HuggingFace API error: ${response.statusText}. ${errorText}`);
+      }
+
+      const data = await response.json();
+      ctx.response.body = transformResponse(data);
+    } catch (error) {
+      console.error("Request error:", error);
+      throw error;
     }
-
-    const data = await response.json();
-    ctx.response.body = transformResponse(data);
   }
 });
 
 // 健康检查端点
 router.get("/health", (ctx) => {
-  ctx.response.body = { status: "ok", timestamp: new Date().toISOString() };
+  ctx.response.body = { 
+    status: "ok", 
+    timestamp: new Date().toISOString(),
+    token: CONFIG.HF_TOKEN ? "configured" : "missing"
+  };
 });
 
 app.use(router.routes());
