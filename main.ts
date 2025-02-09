@@ -1,60 +1,14 @@
-// deps.ts
-export { Application, Router } from "https://deno.land/x/oak@v12.6.1/mod.ts";
-export { config } from "https://deno.land/x/dotenv@v3.2.2/mod.ts";
+import { Application, Router } from "https://deno.land/x/oak@v12.6.1/mod.ts";
 
-// config.ts
-import { config } from "./deps.ts";
-
-await config({ export: true, allowEmptyValues: true });
-
-export const CONFIG = {
+// 配置
+const CONFIG = {
   PORT: parseInt(Deno.env.get("PORT") || "8000"),
   HF_TOKEN: Deno.env.get("HF_TOKEN") || "",
   DEFAULT_MODEL: "google/gemma-2-2b-it",
 };
 
-// utils/response.ts
-export function transformResponse(hfResponse: any) {
-  return {
-    id: crypto.randomUUID(),
-    object: "chat.completion",
-    created: Date.now(),
-    model: hfResponse.model || "unknown",
-    choices: [{
-      index: 0,
-      message: {
-        role: "assistant",
-        content: hfResponse.generated_text || hfResponse[0]?.generated_text || ""
-      },
-      finish_reason: "stop"
-    }],
-    usage: {
-      prompt_tokens: -1,
-      completion_tokens: -1,
-      total_tokens: -1
-    }
-  };
-}
-
-export function transformStreamResponse(chunk: any) {
-  return {
-    id: crypto.randomUUID(),
-    object: "chat.completion.chunk",
-    created: Date.now(),
-    model: "unknown",
-    choices: [{
-      index: 0,
-      delta: {
-        role: "assistant",
-        content: chunk
-      },
-      finish_reason: null
-    }]
-  };
-}
-
-// utils/sse.ts
-export class SSEWriter {
+// SSE 工具类
+class SSEWriter {
   private controller: ReadableStreamDefaultController<Uint8Array>;
   private encoder = new TextEncoder();
 
@@ -81,52 +35,80 @@ export class SSEWriter {
   }
 }
 
-// middleware/cors.ts
-import { Application } from "../deps.ts";
-
-export function setupCors(app: Application) {
-  app.use(async (ctx, next) => {
-    ctx.response.headers.set("Access-Control-Allow-Origin", "*");
-    ctx.response.headers.set("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
-    ctx.response.headers.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
-    
-    if (ctx.request.method === "OPTIONS") {
-      ctx.response.status = 200;
-      return;
+// 响应转换工具
+function transformResponse(hfResponse: any) {
+  return {
+    id: crypto.randomUUID(),
+    object: "chat.completion",
+    created: Date.now(),
+    model: hfResponse.model || "unknown",
+    choices: [{
+      index: 0,
+      message: {
+        role: "assistant",
+        content: hfResponse.generated_text || hfResponse[0]?.generated_text || ""
+      },
+      finish_reason: "stop"
+    }],
+    usage: {
+      prompt_tokens: -1,
+      completion_tokens: -1,
+      total_tokens: -1
     }
-    
-    await next();
-  });
+  };
 }
 
-// middleware/error.ts
-import { Application } from "../deps.ts";
-
-export function setupErrorHandler(app: Application) {
-  app.use(async (ctx, next) => {
-    try {
-      await next();
-    } catch (err) {
-      console.error("Error:", err);
-      ctx.response.status = 500;
-      ctx.response.body = {
-        error: {
-          message: err.message,
-          type: "internal_server_error"
-        }
-      };
-    }
-  });
+function transformStreamResponse(chunk: any) {
+  return {
+    id: crypto.randomUUID(),
+    object: "chat.completion.chunk",
+    created: Date.now(),
+    model: "unknown",
+    choices: [{
+      index: 0,
+      delta: {
+        role: "assistant",
+        content: chunk
+      },
+      finish_reason: null
+    }]
+  };
 }
 
-// routes/chat.ts
-import { Router } from "../deps.ts";
-import { CONFIG } from "../config.ts";
-import { transformResponse, transformStreamResponse } from "../utils/response.ts";
-import { SSEWriter } from "../utils/sse.ts";
-
+const app = new Application();
 const router = new Router();
 
+// CORS 中间件
+app.use(async (ctx, next) => {
+  ctx.response.headers.set("Access-Control-Allow-Origin", "*");
+  ctx.response.headers.set("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
+  ctx.response.headers.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  
+  if (ctx.request.method === "OPTIONS") {
+    ctx.response.status = 200;
+    return;
+  }
+  
+  await next();
+});
+
+// 错误处理中间件
+app.use(async (ctx, next) => {
+  try {
+    await next();
+  } catch (err) {
+    console.error("Error:", err);
+    ctx.response.status = 500;
+    ctx.response.body = {
+      error: {
+        message: err.message,
+        type: "internal_server_error"
+      }
+    };
+  }
+});
+
+// Chat completion endpoint
 router.post("/v1/chat/completions", async (ctx) => {
   const body = await ctx.request.body().value;
   const { 
@@ -203,32 +185,13 @@ router.post("/v1/chat/completions", async (ctx) => {
   }
 });
 
-export default router;
-
-// main.ts
-import { Application } from "./deps.ts";
-import { CONFIG } from "./config.ts";
-import { setupCors } from "./middleware/cors.ts";
-import { setupErrorHandler } from "./middleware/error.ts";
-import chatRouter from "./routes/chat.ts";
-
-const app = new Application();
-
-// 设置中间件
-setupCors(app);
-setupErrorHandler(app);
-
-// 设置路由
-app.use(chatRouter.routes());
-app.use(chatRouter.allowedMethods());
-
 // 健康检查端点
-app.use((ctx) => {
-  if (ctx.request.url.pathname === "/health") {
-    ctx.response.body = { status: "ok", timestamp: new Date().toISOString() };
-  }
+router.get("/health", (ctx) => {
+  ctx.response.body = { status: "ok", timestamp: new Date().toISOString() };
 });
 
-// 启动服务器
+app.use(router.routes());
+app.use(router.allowedMethods());
+
 console.log(`Server running on port ${CONFIG.PORT}`);
 await app.listen({ port: CONFIG.PORT });
