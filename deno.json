@@ -1,9 +1,5 @@
 {
   "tasks": {
-    "dev": "deno run --allow-net --allow-env --allow-read main.ts",
-    "start": "deno run --allow-net --allow-env main.ts"
-  },
-  "imports": {
-    "@/": "./"
+    "start": "deno run --allow-net main.ts"
   }
 }
